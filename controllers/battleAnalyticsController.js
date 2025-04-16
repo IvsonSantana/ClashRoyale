@@ -1,191 +1,207 @@
 const Player = require('../models/playersModels');
 const _ = require('lodash');
 
-
+// 1. Porcentagem de vitórias e derrotas com a carta X
 const getWinLossPercentageByCard = async (req, res) => {
   const { cardName, start, end } = req.query;
-
   if (!cardName || !start || !end) {
     return res.status(400).json({ success: false, message: 'Parâmetros cardName, start e end são obrigatórios' });
   }
 
-  const startDate = new Date(start);
-  const endDate = new Date(end);
-
-  const players = await Player.find({ 'battleLog.battleTime': { $gte: startDate, $lte: endDate } });
-
-  let wins = 0;
-  let losses = 0;
-
-  players.forEach(player => {
-    player.battleLog.forEach(battle => {
-      if (
-        new Date(battle.battleTime) >= startDate &&
-        new Date(battle.battleTime) <= endDate &&
-        battle.deckUsed.some(card => card.name === cardName)
-      ) {
-        if (battle.result === 'win') wins++;
-        else if (battle.result === 'loss') losses++;
+  try {
+    const result = await Player.aggregate([
+      { $unwind: "$battleLog" },
+      {
+        $match: {
+          "battleLog.battleTime": { $gte: new Date(start), $lte: new Date(end) },
+          "battleLog.deckUsed.name": cardName
+        }
+      },
+      {
+        $group: {
+          _id: "$battleLog.result",
+          total: { $sum: 1 }
+        }
       }
+    ]);
+
+    let total = 0, win = 0, loss = 0;
+    result.forEach(r => {
+      total += r.total;
+      if (r._id === 'win') win = r.total;
+      if (r._id === 'loss') loss = r.total;
     });
-  });
 
-  const total = wins + losses;
-  const winPct = total ? ((wins / total) * 100).toFixed(2) : 0;
-  const lossPct = total ? ((losses / total) * 100).toFixed(2) : 0;
-
-  res.json({ success: true, data: { winPct, lossPct } });
+    res.json({ success: true, data: {
+      winPct: total ? ((win / total) * 100).toFixed(2) : 0,
+      lossPct: total ? ((loss / total) * 100).toFixed(2) : 0
+    }});
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 };
 
-// 2. Decks completos com mais de X% de vitórias em um intervalo
+// 2. Decks com mais de X% de vitórias
 const getDecksWithWinRate = async (req, res) => {
   const { minWinRate, start, end } = req.query;
-
   if (!minWinRate || !start || !end) {
     return res.status(400).json({ success: false, message: 'Parâmetros minWinRate, start e end são obrigatórios' });
   }
 
-  const startDate = new Date(start);
-  const endDate = new Date(end);
-  const deckStats = {};
+  try {
+    const result = await Player.aggregate([
+      { $unwind: "$battleLog" },
+      {
+        $match: {
+          "battleLog.battleTime": { $gte: new Date(start), $lte: new Date(end) },
+          "battleLog.deckUsed.7": { $exists: true }
+        }
+      },
+      {
+        $project: {
+          deckKey: {
+            $reduce: {
+              input: { $map: { input: "$battleLog.deckUsed", as: "c", in: "$$c.name" } },
+              initialValue: "",
+              in: { $cond: [{ $eq: ["$$value", ""] }, "$$this", { $concat: ["$$value", ",", "$$this"] }] }
+            }
+          },
+          result: "$battleLog.result"
+        }
+      },
+      {
+        $group: {
+          _id: "$deckKey",
+          total: { $sum: 1 },
+          wins: { $sum: { $cond: [{ $eq: ["$result", "win"] }, 1, 0] } }
+        }
+      },
+      {
+        $project: {
+          deck: { $split: ["$_id", ","] },
+          winRate: { $multiply: [{ $divide: ["$wins", "$total"] }, 100] }
+        }
+      },
+      { $match: { winRate: { $gte: Number(minWinRate) } } },
+      { $sort: { winRate: -1 } }
+    ]);
 
-  const players = await Player.find({ 'battleLog.battleTime': { $gte: startDate, $lte: endDate } });
-
-  players.forEach(player => {
-    player.battleLog.forEach(battle => {
-      if (
-        new Date(battle.battleTime) >= startDate &&
-        new Date(battle.battleTime) <= endDate &&
-        battle.deckUsed.length === 8
-      ) {
-        const deckKey = battle.deckUsed.map(card => card.name).sort().join(',');
-
-        if (!deckStats[deckKey]) deckStats[deckKey] = { wins: 0, total: 0 };
-
-        deckStats[deckKey].total++;
-        if (battle.result === 'win') deckStats[deckKey].wins++;
-      }
-    });
-  });
-
-  const result = Object.entries(deckStats)
-    .map(([deck, stats]) => ({
-      deck: deck.split(','),
-      winRate: ((stats.wins / stats.total) * 100).toFixed(2),
-    }))
-    .filter(entry => entry.winRate >= minWinRate);
-
-  res.json({ success: true, data: result });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 };
 
-// 3. Derrotas com combo específico de cartas
+// 3. Derrotas com combo
 const getLossesByCardCombo = async (req, res) => {
   const { combo, start, end } = req.query;
-
   if (!combo || !start || !end) {
     return res.status(400).json({ success: false, message: 'Parâmetros combo, start e end são obrigatórios' });
   }
 
-  const comboArray = combo.split(',').map(name => name.trim());
-  const startDate = new Date(start);
-  const endDate = new Date(end);
+  const comboArray = combo.split(',').map(c => c.trim());
 
-  let lossCount = 0;
-
-  const players = await Player.find({ 'battleLog.battleTime': { $gte: startDate, $lte: endDate } });
-
-  players.forEach(player => {
-    player.battleLog.forEach(battle => {
-      if (
-        new Date(battle.battleTime) >= startDate &&
-        new Date(battle.battleTime) <= endDate &&
-        battle.result === 'loss'
-      ) {
-        const usedCards = battle.deckUsed.map(card => card.name);
-        if (comboArray.every(card => usedCards.includes(card))) {
-          lossCount++;
+  try {
+    const result = await Player.aggregate([
+      { $unwind: "$battleLog" },
+      {
+        $match: {
+          "battleLog.battleTime": { $gte: new Date(start), $lte: new Date(end) },
+          "battleLog.result": "loss",
+          "battleLog.deckUsed.name": { $all: comboArray }
         }
-      }
-    });
-  });
+      },
+      { $count: "losses" }
+    ]);
 
-  res.json({ success: true, data: { combo: comboArray, losses: lossCount } });
+    res.json({ success: true, data: { combo: comboArray, losses: result[0]?.losses || 0 } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 };
 
-// 4. Vitórias com carta X, menos troféus, <2min, oponente destruiu >=2 torres
+// 4. Vitórias com condições específicas
 const getSpecialWins = async (req, res) => {
   const { cardName, trophyDiffPercent } = req.query;
-
   if (!cardName || !trophyDiffPercent) {
     return res.status(400).json({ success: false, message: 'Parâmetros cardName e trophyDiffPercent são obrigatórios' });
   }
 
-  const players = await Player.find();
+  try {
+    const percent = parseFloat(trophyDiffPercent) / 100;
 
-  let count = 0;
+    const result = await Player.aggregate([
+      { $unwind: "$battleLog" },
+      {
+        $match: {
+          "battleLog.result": "win",
+          "battleLog.deckUsed.name": cardName,
+          "battleLog.duration": { $lt: 120 },
+          "battleLog.opponent.towersDestroyed": { $gte: 2 },
+          $expr: {
+            $lte: ["$trophies", { $subtract: ["$battleLog.opponent.trophies", { $multiply: ["$battleLog.opponent.trophies", percent] }] }]
+          }
+        }
+      },
+      { $count: "victories" }
+    ]);
 
-  players.forEach(player => {
-    player.battleLog.forEach(battle => {
-      if (
-        battle.result === 'win' &&
-        battle.deckUsed.some(card => card.name === cardName) &&
-        battle.opponent &&
-        battle.opponent.trophies &&
-        player.trophies &&
-        (player.trophies <= battle.opponent.trophies * (1 - parseFloat(trophyDiffPercent) / 100)) &&
-        battle.duration < 120 && // em segundos
-        battle.opponent.towersDestroyed >= 2
-      ) {
-        count++;
-      }
-    });
-  });
-
-  res.json({ success: true, data: { victories: count } });
+    res.json({ success: true, data: { victories: result[0]?.victories || 0 } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 };
 
 // 5. Combos de N cartas com mais de Y% de vitórias
 const getBestCardCombos = async (req, res) => {
   const { size, minWinRate, start, end } = req.query;
-
   if (!size || !minWinRate || !start || !end) {
     return res.status(400).json({ success: false, message: 'Parâmetros size, minWinRate, start e end são obrigatórios' });
   }
 
-  const startDate = new Date(start);
-  const endDate = new Date(end);
-  const comboStats = {};
+  const sizeN = Number(size);
 
-  const players = await Player.find({ 'battleLog.battleTime': { $gte: startDate, $lte: endDate } });
+  try {
+    const result = await Player.aggregate([
+      { $unwind: "$battleLog" },
+      {
+        $match: {
+          "battleLog.battleTime": { $gte: new Date(start), $lte: new Date(end) }
+        }
+      },
+      {
+        $project: {
+          cards: { $map: { input: "$battleLog.deckUsed", as: "c", in: "$$c.name" } },
+          isWin: { $cond: [{ $eq: ["$battleLog.result", "win"] }, 1, 0] }
+        }
+      },
+      {
+        $project: {
+          combo: { $slice: ["$cards", sizeN] },
+          isWin: 1
+        }
+      },
+      {
+        $group: {
+          _id: "$combo",
+          total: { $sum: 1 },
+          wins: { $sum: "$isWin" }
+        }
+      },
+      {
+        $project: {
+          combo: "$_id",
+          winRate: { $multiply: [{ $divide: ["$wins", "$total"] }, 100] }
+        }
+      },
+      { $match: { winRate: { $gte: Number(minWinRate) } } },
+      { $sort: { winRate: -1 } }
+    ]);
 
-  players.forEach(player => {
-    player.battleLog.forEach(battle => {
-      if (
-        new Date(battle.battleTime) >= startDate &&
-        new Date(battle.battleTime) <= endDate &&
-        battle.deckUsed.length >= size
-      ) {
-        const cardNames = battle.deckUsed.map(card => card.name).sort();
-        const combos = _.combinations(cardNames, parseInt(size));
-
-        combos.forEach(combo => {
-          const key = combo.join(',');
-          if (!comboStats[key]) comboStats[key] = { wins: 0, total: 0 };
-          comboStats[key].total++;
-          if (battle.result === 'win') comboStats[key].wins++;
-        });
-      }
-    });
-  });
-
-  const result = Object.entries(comboStats)
-    .map(([combo, stats]) => ({
-      combo: combo.split(','),
-      winRate: ((stats.wins / stats.total) * 100).toFixed(2),
-    }))
-    .filter(entry => entry.winRate >= minWinRate);
-
-  res.json({ success: true, data: result });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 };
 
 module.exports = {
